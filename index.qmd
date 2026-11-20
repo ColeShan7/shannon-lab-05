@@ -1,0 +1,1758 @@
+---
+title: "Lab 5: Count Regression"
+subtitle: "Physician Office Visits Among Older Adults"
+author: "Cole Shannon"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+editor: source
+execute:
+  warning: false
+  message: false
+  echo: true
+knitr:
+  opts_chunk:
+    fig.align: center
+    dpi: 130
+---
+
+# Introduction
+
+This report examines factors associated with the number of physician office visits among older adults in the National Medical Expenditure Survey. Because physician visits are nonnegative integer counts, we begin by exploring the distribution and then compare Gaussian and Poisson regression models. Later sections evaluate dispersion, negative binomial alternatives, excess zeros, and an interaction.
+
+# Part 1: Data Preparation and Exploration
+
+## 1.1 Load packages and prepare the data
+
+```{r}
+#| label: setup
+#| include: false
+
+library(tidyverse)
+library(glmmTMB)
+library(DHARMa)
+library(ggeffects)
+library(emmeans)
+library(broom.mixed)
+library(gt)
+library(AER)
+
+data("NMES1988", package = "AER")
+
+analysis_data <- NMES1988 |>
+  select(visits, chronic, health, gender, school, insurance) |>
+  mutate(
+    health = fct_relevel(factor(health), "average"),
+    gender = fct_relevel(factor(gender), "male"),
+    insurance = fct_relevel(factor(insurance), "no")
+  ) |>
+  drop_na()
+
+format_p <- function(p) {
+  if (is.na(p)) return("p unavailable")
+  if (p < .001) return("p < .001")
+  paste0("p = ", sprintf("%.3f", p))
+}
+
+format_num <- function(x, digits = 2) {
+  formatC(
+    as.numeric(x),
+    format = "f",
+    digits = digits,
+    big.mark = ","
+  )
+}
+
+# Clean diagnostic plots using DHARMa residuals.
+# Statistical tests are displayed in tables instead of over points.
+
+plot_dharma_qq <- function(residual_object, heading) {
+
+  n <- length(residual_object$scaledResiduals)
+
+  qq_data <- tibble(
+    Expected = ppoints(n),
+    Observed = sort(residual_object$scaledResiduals)
+  )
+
+  ggplot(qq_data, aes(x = Expected, y = Observed)) +
+    geom_abline(
+      slope = 1,
+      intercept = 0,
+      linetype = "dashed",
+      color = "#B85050",
+      linewidth = 0.6
+    ) +
+    geom_point(
+      size = 0.7,
+      alpha = 0.45,
+      color = "#32649A"
+    ) +
+    coord_equal(
+      xlim = c(0, 1),
+      ylim = c(0, 1),
+      expand = FALSE
+    ) +
+    labs(
+      title = heading,
+      x = "Expected uniform quantiles",
+      y = "Observed DHARMa quantiles"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+      plot.margin = margin(12, 15, 12, 12)
+    )
+}
+
+plot_dharma_fitted <- function(residual_object, heading) {
+
+  residual_data <- tibble(
+    Fitted = residual_object$fittedPredictedResponse,
+    Residual = residual_object$scaledResiduals
+  )
+
+  ggplot(residual_data, aes(x = Fitted, y = Residual)) +
+    geom_hline(
+      yintercept = c(0.25, 0.5, 0.75),
+      linetype = "dashed",
+      linewidth = 0.35,
+      color = "grey65"
+    ) +
+    geom_point(
+      size = 0.85,
+      alpha = 0.16,
+      color = "#32649A"
+    ) +
+    scale_y_continuous(
+      limits = c(0, 1),
+      breaks = seq(0, 1, 0.25)
+    ) +
+    labs(
+      title = heading,
+      x = "Predicted physician visits",
+      y = "Scaled DHARMa residual"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+      plot.margin = margin(12, 15, 12, 12)
+    )
+}
+```
+
+The outcome is the number of physician office visits (`visits`). The five predictors are number of chronic conditions (`chronic`), self-perceived health (`health`), gender (`gender`), years of education (`school`), and private insurance (`insurance`).
+
+The reference groups are **average health**, **male**, and **no private insurance**.
+
+## 1.2 Descriptive statistics
+
+```{r}
+#| label: descriptives
+
+visit_summary <- analysis_data |>
+  summarise(
+    n = n(),
+    mean = mean(visits),
+    variance = var(visits),
+    zero_percent = 100 * mean(visits == 0),
+    maximum = max(visits)
+  )
+
+visit_summary |>
+  gt() |>
+  cols_label(
+    n = "N",
+    mean = "Mean",
+    variance = "Variance",
+    zero_percent = "Zeros (%)",
+    maximum = "Maximum"
+  ) |>
+  fmt_number(
+    columns = c(mean, variance, zero_percent),
+    decimals = 2
+  ) |>
+  tab_header(
+    title = "Descriptive Statistics for Physician Visits"
+  )
+```
+
+## 1.3 Distribution of physician visits
+
+```{r}
+#| label: visits-plot
+#| fig-width: 10
+#| fig-height: 5
+#| fig-cap: "Distribution of physician office visits."
+
+ggplot(analysis_data, aes(x = visits)) +
+  geom_bar(
+    fill = "#356BA0",
+    width = 0.85
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 90, 10)
+  ) +
+  labs(
+    x = "Number of physician office visits",
+    y = "Number of participants"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+Physician office visits are nonnegative integer counts. Among `r visit_summary$n` participants, the mean was `r round(visit_summary$mean, 2)` and the variance was `r round(visit_summary$variance, 2)`.
+
+The variance was `r round(visit_summary$variance / visit_summary$mean, 2)` times the mean. Approximately `r round(visit_summary$zero_percent, 1)`% of participants recorded no visits, and the largest observed count was `r visit_summary$maximum`.
+
+These results indicate that the distribution is substantially more variable than would be expected under a simple Poisson process. The presence of zero visits and unusually large counts also suggests that dispersion and zero inflation should be examined before interpreting regression coefficients.
+
+# Part 2: Specify Competing Count Models
+
+## 2.1 Why not a linear model?
+
+We first fit a Gaussian model using all five predictors and inspect simulation-based residuals.
+
+```{r}
+#| label: gaussian-model
+
+gaussian_model <- glmmTMB(
+  visits ~ chronic + health + gender + school + insurance,
+  data = analysis_data,
+  family = gaussian(link = "identity")
+)
+
+set.seed(9041)
+
+gaussian_residuals <- simulateResiduals(
+  gaussian_model,
+  n = 500,
+  plot = FALSE
+)
+
+gaussian_uniformity <- testUniformity(
+  gaussian_residuals,
+  plot = FALSE
+)
+```
+
+### Gaussian model: Q-Q plot
+
+```{r}
+#| label: gaussian-qq-plot
+#| fig-width: 8
+#| fig-height: 5.8
+#| fig-cap: "DHARMa uniform Q-Q plot for the Gaussian model."
+
+plot_dharma_qq(
+  gaussian_residuals,
+  "Gaussian model: residual Q-Q plot"
+)
+```
+
+### Gaussian model: residuals versus fitted values
+
+```{r}
+#| label: gaussian-fitted-plot
+#| fig-width: 8
+#| fig-height: 5.8
+#| fig-cap: "DHARMa scaled residuals versus predicted physician visits."
+
+plot_dharma_fitted(
+  gaussian_residuals,
+  "Gaussian model: residuals vs. fitted"
+)
+```
+
+### Interpretation
+
+The Gaussian model's DHARMa uniformity test was significant (`r format_p(gaussian_uniformity$p.value)`). Visually, the Q-Q plot departs substantially from the expected diagonal line, while the residual-versus-fitted plot displays a downward, wedge-shaped concentration of observations rather than a uniform distribution across the predicted values.
+
+These patterns indicate that the Gaussian model does not adequately reproduce important features of the observed distribution.
+
+More fundamentally, Gaussian regression treats physician visits as a continuous outcome, assumes a constant residual variance, and can produce predictions below zero. Because physician visits are nonnegative integer counts with substantial positive skew, a count regression model is more appropriate.
+
+## 2.2 Fit three nested Poisson models
+
+We next fit three nested Poisson regression models using a log link.
+
+The models are:
+
+- **M0:** Intercept-only model.
+- **M1:** Chronic conditions as the only predictor.
+- **M2:** Chronic conditions, perceived health, gender, education, and insurance.
+
+```{r}
+#| label: poisson-models
+
+m0 <- glmmTMB(
+  visits ~ 1,
+  data = analysis_data,
+  family = poisson(link = "log")
+)
+
+m1 <- glmmTMB(
+  visits ~ chronic,
+  data = analysis_data,
+  family = poisson(link = "log")
+)
+
+m2 <- glmmTMB(
+  visits ~ chronic + health + gender + school + insurance,
+  data = analysis_data,
+  family = poisson(link = "log")
+)
+```
+
+## 2.3 Compare nested Poisson models
+
+Likelihood-ratio tests evaluate whether adding predictors improves model fit.
+
+We also examine AIC and BIC, with smaller values indicating a more favourable balance between goodness of fit and model complexity.
+
+```{r}
+#| label: poisson-comparisons
+
+poisson_lrt <- anova(m0, m1, m2)
+
+poisson_table <- as.data.frame(poisson_lrt) |>
+  tibble::rownames_to_column("Model")
+
+poisson_table |>
+  gt() |>
+  tab_header(
+    title = "Nested Poisson Model Comparisons"
+  ) |>
+  fmt_number(
+    columns = c(AIC, BIC, logLik, deviance, Chisq),
+    decimals = 2
+  ) |>
+  fmt(
+    columns = `Pr(>Chisq)`,
+    fns = function(x) {
+      ifelse(
+        is.na(x),
+        "—",
+        ifelse(x < .001, "< .001", sprintf("%.3f", x))
+      )
+    }
+  )
+```
+
+### Interpretation of model comparisons
+
+Adding chronic conditions (M1 versus M0) yielded a likelihood-ratio test of χ²(`r poisson_lrt[2, "Chi Df"]`) = `r format_num(poisson_lrt[2, "Chisq"])`, `r format_p(poisson_lrt[2, "Pr(>Chisq)"])`.
+
+This comparison determines whether chronic conditions significantly improve the prediction of physician visits compared with an intercept-only model.
+
+Adding perceived health, gender, education, and insurance (M2 versus M1) yielded χ²(`r poisson_lrt[3, "Chi Df"]`) = `r format_num(poisson_lrt[3, "Chisq"])`, `r format_p(poisson_lrt[3, "Pr(>Chisq)"])`.
+
+This comparison evaluates whether those additional predictors collectively improve prediction after accounting for chronic conditions.
+
+## 2.4 Select the provisional Poisson model
+
+```{r}
+#| label: provisional-selection
+#| include: false
+
+selected_poisson <- if (
+  poisson_lrt[3, "Pr(>Chisq)"] < .05
+) {
+  "M2 (full model)"
+} else if (
+  poisson_lrt[2, "Pr(>Chisq)"] < .05
+) {
+  "M1 (chronic conditions)"
+} else {
+  "M0 (intercept only)"
+}
+```
+
+On the basis of the nested likelihood-ratio tests at α = .05, the provisionally preferred Poisson model is **`r selected_poisson`**.
+
+However, a statistically significant improvement in relative model fit does not guarantee that the selected model adequately represents the data. We therefore evaluate dispersion, zero inflation, and residual patterns before deciding whether Poisson regression is appropriate.
+
+# Part 3: Evaluate the Poisson Model
+
+## 3.1 Simulate residuals for the full Poisson model
+
+We use DHARMa to simulate 500 datasets from the full Poisson model (M2).
+
+Simulation-based residuals allow us to assess whether the model reproduces patterns observed in the data.
+
+The Q-Q plot and residual-versus-predicted plot are displayed separately to improve readability.
+
+```{r}
+#| label: poisson-dharma
+
+set.seed(9041)
+
+res_pois <- simulateResiduals(
+  m2,
+  n = 500,
+  plot = FALSE
+)
+```
+
+### Poisson model: Q-Q plot
+
+```{r}
+#| label: poisson-qq-plot
+#| fig-width: 8
+#| fig-height: 5.8
+#| fig-cap: "DHARMa uniform Q-Q plot for the full Poisson model."
+
+plot_dharma_qq(
+  res_pois,
+  "Poisson M2: residual Q-Q plot"
+)
+```
+
+### Poisson model: residuals versus fitted values
+
+```{r}
+#| label: poisson-fitted-plot
+#| fig-width: 8
+#| fig-height: 5.8
+#| fig-cap: "DHARMa scaled residuals versus predicted visits for M2."
+
+plot_dharma_fitted(
+  res_pois,
+  "Poisson M2: residuals vs. fitted"
+)
+```
+
+## 3.2 Test dispersion and zero inflation
+
+We use three formal DHARMa tests to evaluate the full Poisson model:
+
+- **Dispersion test:** Does the model adequately represent variability?
+- **Zero-inflation test:** Does the model predict the correct number of zero counts?
+- **Uniformity test:** Does the residual distribution match the expected uniform distribution?
+
+```{r}
+#| label: poisson-diagnostic-tests
+
+disp_pois <- testDispersion(
+  res_pois,
+  plot = FALSE
+)
+
+zi_pois <- testZeroInflation(
+  res_pois,
+  plot = FALSE
+)
+
+uniform_pois <- testUniformity(
+  res_pois,
+  plot = FALSE
+)
+
+poisson_diagnostics <- tibble(
+  Test = c(
+    "Dispersion",
+    "Observed/expected zeros",
+    "Residual uniformity"
+  ),
+  Ratio = c(
+    unname(disp_pois$statistic),
+    unname(zi_pois$statistic),
+    NA_real_
+  ),
+  `p-value` = c(
+    disp_pois$p.value,
+    zi_pois$p.value,
+    uniform_pois$p.value
+  )
+)
+
+poisson_diagnostics |>
+  gt() |>
+  tab_header(
+    title = "Full Poisson Model: DHARMa Diagnostic Tests"
+  ) |>
+  fmt_number(
+    columns = Ratio,
+    decimals = 2
+  ) |>
+  fmt(
+    columns = `p-value`,
+    fns = function(x) {
+      ifelse(
+        is.na(x),
+        "—",
+        ifelse(x < .001, "< .001", sprintf("%.3f", x))
+      )
+    }
+  ) |>
+  sub_missing(
+    columns = Ratio,
+    missing_text = "—"
+  )
+```
+
+## 3.3 Interpret the diagnostics
+
+The dispersion ratio for M2 was **`r format_num(unname(disp_pois$statistic))`** (`r format_p(disp_pois$p.value)`).
+
+`r if (disp_pois$p.value < .05 && unname(disp_pois$statistic) > 1) "The significant ratio above one indicates substantial overdispersion: the outcome is more variable than the fitted Poisson model expects." else if (disp_pois$p.value < .05) "The significant test indicates a dispersion mismatch with the Poisson model." else "The test does not provide strong evidence of a dispersion mismatch."`
+
+The observed-to-expected ratio of zeros was **`r format_num(unname(zi_pois$statistic))`** (`r format_p(zi_pois$p.value)`).
+
+`r if (zi_pois$p.value < .05 && unname(zi_pois$statistic) > 1) "The model substantially underpredicts the observed number of zero visits." else if (zi_pois$p.value < .05) "The model predicts a significantly different number of zeros than observed." else "The observed number of zeros is consistent with the model's predictions."`
+
+The residual-uniformity test yielded `r format_p(uniform_pois$p.value)`.
+
+### Interpretation of the graphs
+
+The Poisson Q-Q plot shows a pronounced S-shaped departure from the reference diagonal. The residual-versus-fitted plot also reveals concentrations of observations near zero and one rather than an approximately uniform distribution.
+
+Together, these patterns suggest that the Poisson model does not reproduce the observed count distribution adequately. They are consistent with the significant dispersion, zero-inflation, and uniformity tests.
+
+### Why overdispersion matters
+
+The Poisson model assumes that the conditional variance equals the conditional mean.
+
+When the outcome is overdispersed, the model-based standard errors can be underestimated. This can produce confidence intervals that are too narrow and p-values that are overly optimistic, increasing the risk of incorrectly concluding that predictors are statistically significant.
+
+### Why we should not immediately fit a zero-inflated model
+
+Excess zeros do not necessarily indicate a separate structural-zero process.
+
+Overdispersion can itself cause a Poisson model to underestimate the number of zeros. A negative binomial model allows additional variance and may therefore address both overdispersion and excess zeros without requiring an explicit zero-inflation component.
+
+We first estimate a negative binomial model and reassess its diagnostics before deciding whether a separate zero process is necessary.
+
+# Part 4: Negative Binomial Regression
+
+## 4.1 Fit the NB2 model
+
+The Poisson diagnostics indicated substantial overdispersion and many more zeros than predicted.
+
+We therefore fit a negative binomial model (NB2), using the same five predictors and observations as M2.
+
+The NB2 variance is **Var(Y \| X) = μ + μ²/θ**.
+
+The additional dispersion parameter permits the variance to exceed the mean.
+
+```{r}
+#| label: nb2-model
+
+nb2 <- glmmTMB(
+  visits ~ chronic + health + gender + school + insurance,
+  data = analysis_data,
+  family = nbinom2(link = "log")
+)
+```
+
+## 4.2 Compare Poisson and NB2 models
+
+Because Poisson is a limiting case of NB2, we use a likelihood-ratio comparison.
+
+NB2 has one additional parameter that controls dispersion, so the comparison has one degree of freedom.
+
+The usual chi-square reference is approximate because the Poisson corresponds to a boundary limit of NB2.
+
+```{r}
+#| label: nb2-comparison
+
+lrt_nb <- anova(m2, nb2)
+
+as.data.frame(lrt_nb) |>
+  tibble::rownames_to_column("Model") |>
+  gt() |>
+  tab_header(
+    title = "Poisson M2 versus Negative Binomial NB2"
+  ) |>
+  fmt_number(
+    columns = c(AIC, BIC, logLik, deviance, Chisq),
+    decimals = 2
+  ) |>
+  fmt(
+    columns = `Pr(>Chisq)`,
+    fns = function(x) {
+      ifelse(
+        is.na(x),
+        "—",
+        ifelse(x < .001, "< .001", sprintf("%.3f", x))
+      )
+    }
+  )
+```
+
+### Model comparison interpretation
+
+The comparison yielded χ²(`r lrt_nb[2, "Chi Df"]`) = `r format_num(lrt_nb[2, "Chisq"])`, `r format_p(lrt_nb[2, "Pr(>Chisq)"])`.
+
+`r if (lrt_nb[2, "Pr(>Chisq)"] < .05) "The NB2 model significantly improved fit compared with the full Poisson model." else "The likelihood-ratio test did not demonstrate a statistically significant improvement for NB2."`
+
+The corresponding AIC values were `r format_num(AIC(m2))` for Poisson M2 and `r format_num(AIC(nb2))` for NB2.
+
+The improvement indicates that the Poisson model was too restrictive for these data. Its estimated standard errors and confidence intervals should not be relied upon without accounting for the additional variability.
+
+However, better relative fit does not guarantee that the NB2 model is fully adequate. We therefore examine its residual diagnostics.
+
+## 4.3 Recheck NB2 using DHARMa
+
+We simulate 500 datasets using the same seed used for the full Poisson model.
+
+```{r}
+#| label: nb2-dharma
+
+set.seed(9041)
+
+res_nb <- simulateResiduals(
+  nb2,
+  n = 500,
+  plot = FALSE
+)
+
+disp_nb <- testDispersion(
+  res_nb,
+  plot = FALSE
+)
+
+zi_nb <- testZeroInflation(
+  res_nb,
+  plot = FALSE
+)
+
+uniform_nb <- testUniformity(
+  res_nb,
+  plot = FALSE
+)
+```
+
+### NB2 Q-Q plot
+
+```{r}
+#| label: nb2-qq-plot
+#| fig-width: 8
+#| fig-height: 5.8
+#| fig-cap: "Simulation-based Q-Q plot for the negative binomial model."
+
+plot_dharma_qq(
+  res_nb,
+  "NB2: residual Q-Q plot"
+)
+```
+
+### NB2 residuals versus fitted values
+
+```{r}
+#| label: nb2-fitted-plot
+#| fig-width: 8
+#| fig-height: 5.8
+#| fig-cap: "Scaled DHARMa residuals against fitted counts for NB2."
+
+plot_dharma_fitted(
+  res_nb,
+  "NB2: residuals vs. fitted"
+)
+```
+
+### Poisson versus NB2 diagnostic tests
+
+```{r}
+#| label: nb2-diagnostic-comparison
+
+model_diagnostics <- tibble(
+  Model = c(
+    "Poisson M2", "Poisson M2", "Poisson M2",
+    "NB2", "NB2", "NB2"
+  ),
+  Diagnostic = rep(
+    c(
+      "Dispersion",
+      "Observed/expected zeros",
+      "Residual uniformity"
+    ),
+    times = 2
+  ),
+  Ratio = c(
+    unname(disp_pois$statistic),
+    unname(zi_pois$statistic),
+    NA_real_,
+    unname(disp_nb$statistic),
+    unname(zi_nb$statistic),
+    NA_real_
+  ),
+  p_value = c(
+    disp_pois$p.value,
+    zi_pois$p.value,
+    uniform_pois$p.value,
+    disp_nb$p.value,
+    zi_nb$p.value,
+    uniform_nb$p.value
+  )
+)
+
+model_diagnostics |>
+  gt(groupname_col = "Model") |>
+  cols_label(
+    Diagnostic = "Diagnostic",
+    Ratio = "Ratio",
+    p_value = "p-value"
+  ) |>
+  tab_header(
+    title = "DHARMa Diagnostics: Poisson versus NB2"
+  ) |>
+  fmt_number(
+    columns = Ratio,
+    decimals = 2
+  ) |>
+  fmt(
+    columns = p_value,
+    fns = function(x) {
+      ifelse(
+        is.na(x),
+        "—",
+        ifelse(x < .001, "< .001", sprintf("%.3f", x))
+      )
+    }
+  ) |>
+  sub_missing(
+    columns = Ratio,
+    missing_text = "—"
+  )
+```
+
+### NB2 diagnostic interpretation
+
+The NB2 dispersion ratio was **`r format_num(unname(disp_nb$statistic))`** (`r format_p(disp_nb$p.value)`).
+
+`r if (disp_nb$p.value >= .05) "The nonsignificant dispersion test suggests that NB2 represents variability adequately according to this diagnostic." else "The dispersion test remained significant, indicating a continuing dispersion mismatch."`
+
+The NB2 observed-to-expected zero ratio was **`r format_num(unname(zi_nb$statistic))`** (`r format_p(zi_nb$p.value)`).
+
+`r if (zi_nb$p.value >= .05) "The model predicted a number of zeros consistent with the observed data." else if (unname(zi_nb$statistic) > 1) "The model still underpredicted zero visits." else "The model predicted too many zero visits."`
+
+The NB2 residual-uniformity test yielded `r format_p(uniform_nb$p.value)`.
+
+### Interpretation of the graphs
+
+Compared with Poisson, the NB2 Q-Q plot follows the expected diagonal much more closely, suggesting an important improvement in the residual distribution.
+
+Nevertheless, small systematic deviations remain, particularly around the upper-middle quantiles. The residual-versus-fitted plot displays a broader spread of observations without the strong boundary concentrations visible in the Poisson model.
+
+The nonsignificant dispersion test suggests that NB2 resolves the primary variability problem. However, the significant zero-inflation and residual-uniformity tests indicate that the model is not fully adequate.
+
+A separate zero component may therefore provide a further improvement.
+
+## 4.4 Visualize predicted physician visits
+
+We use `predict_response()` to obtain predicted visits across the observed range of chronic conditions. Other predictors are held at their reference or typical values according to the prediction defaults.
+
+```{r}
+#| label: nb2-predictions
+
+pred_nb <- predict_response(
+  nb2,
+  terms = "chronic [all]"
+)
+
+pred_nb_data <- as.data.frame(pred_nb) |>
+  mutate(
+    x = as.numeric(as.character(x))
+  )
+```
+
+```{r}
+#| label: nb2-prediction-plot
+#| fig-width: 9
+#| fig-height: 5.5
+#| fig-cap: "NB2 predicted physician visits across chronic conditions. Shaded band indicates a 95% confidence interval."
+
+ggplot(
+  pred_nb_data,
+  aes(x = x, y = predicted)
+) +
+  geom_ribbon(
+    aes(ymin = conf.low, ymax = conf.high),
+    fill = "#356BA0",
+    alpha = 0.15
+  ) +
+  geom_line(
+    color = "#356BA0",
+    linewidth = 1.1
+  ) +
+  geom_point(
+    color = "#356BA0",
+    size = 1.8
+  ) +
+  labs(
+    title = "Predicted physician visits by chronic conditions",
+    x = "Number of chronic conditions",
+    y = "Predicted physician office visits"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+```
+
+### Why does the predicted line curve?
+
+The line curves even though the model is linear on the log scale.
+
+With a log link, a one-unit increase in chronic conditions produces a constant multiplicative change in expected visits rather than a constant additive change.
+
+Back-transforming the log-linear predictor using the exponential function produces curvature on the count scale. This explains why predicted visits increase more rapidly as the number of chronic conditions increases.
+
+# Part 5: Do the Zeros Need Their Own Model?
+
+## 5.1 Decide whether another zero model is justified
+
+The NB2 model substantially improved the dispersion problem. Its dispersion ratio was `r format_num(unname(disp_nb$statistic))` (`r format_p(disp_nb$p.value)`).
+
+However, its observed-to-expected zero ratio was `r format_num(unname(zi_nb$statistic))` (`r format_p(zi_nb$p.value)`).
+
+`r if (zi_nb$p.value < .05 && unname(zi_nb$statistic) > 1) "The significant ratio above one indicates that NB2 still predicts too few zero visits, providing justification for comparing models with a separate zero component." else if (zi_nb$p.value >= .05) "The observed number of zeros is consistent with NB2 predictions, so an additional zero component is not required by this diagnostic." else "A significant discrepancy in the number of zeros remains, warranting further investigation."`
+
+We consider two alternatives:
+
+- **Zero-inflated negative binomial (ZINB):** Zeros can arise from either the count-generating process or a separate structural-zero process.
+- **Hurdle negative binomial:** A separate process models whether a person records any physician visits, while positive visit counts are modelled using a zero-truncated negative binomial distribution.
+
+Both models include the same five predictors in their conditional count and zero components.
+
+These models represent statistical processes and do not establish that particular individuals belong to a literal group that can never visit a physician.
+
+```{r}
+#| label: zero-models
+
+zinb <- glmmTMB(
+  visits ~ chronic + health + gender + school + insurance,
+  ziformula = ~ chronic + health + gender + school + insurance,
+  data = analysis_data,
+  family = nbinom2(link = "log")
+)
+
+hurdle_nb <- glmmTMB(
+  visits ~ chronic + health + gender + school + insurance,
+  ziformula = ~ chronic + health + gender + school + insurance,
+  data = analysis_data,
+  family = truncated_nbinom2(link = "log")
+)
+
+fit_is_ok <- function(model) {
+  isTRUE(model$fit$convergence == 0) &&
+    isTRUE(model$sdr$pdHess) &&
+    is.finite(as.numeric(logLik(model)))
+}
+
+candidate_models <- list(
+  "NB2" = nb2,
+  "ZINB" = zinb,
+  "Hurdle NB" = hurdle_nb
+)
+```
+
+## 5.2 Compare NB2 and ZINB using a likelihood-ratio test
+
+NB2 and ZINB have the same conditional count predictors, but ZINB additionally estimates `r length(fixef(zinb)$zi)` parameters in its zero component.
+
+The comparison uses a likelihood-ratio test, although the conventional chi-square reference distribution is approximate because the no-zero-inflation null hypothesis lies on the boundary of the parameter space.
+
+```{r}
+#| label: zinb-lrt
+
+if (fit_is_ok(zinb)) {
+
+  lrt_zinb <- anova(nb2, zinb)
+
+  as.data.frame(lrt_zinb) |>
+    tibble::rownames_to_column("Model") |>
+    gt() |>
+    tab_header(
+      title = "NB2 versus ZINB: Likelihood-Ratio Comparison"
+    ) |>
+    fmt_number(
+      columns = c(AIC, BIC, logLik, deviance, Chisq),
+      decimals = 2
+    ) |>
+    fmt(
+      columns = `Pr(>Chisq)`,
+      fns = function(x) {
+        ifelse(
+          is.na(x),
+          "—",
+          ifelse(x < .001, "< .001", sprintf("%.3f", x))
+        )
+      }
+    )
+
+} else {
+
+  lrt_zinb <- NULL
+
+  tibble(
+    Result = "ZINB did not pass convergence/Hessian checks"
+  ) |>
+    gt()
+}
+```
+
+`r if (!is.null(lrt_zinb) && is.finite(lrt_zinb[2, "Chisq"])) paste0("The approximate NB2–ZINB likelihood-ratio comparison yielded χ²(", lrt_zinb[2, "Chi Df"], ") = ", format_num(lrt_zinb[2, "Chisq"]), ", ", format_p(lrt_zinb[2, "Pr(>Chisq)"]), ". This result is interpreted alongside information criteria and residual diagnostics because the chi-square reference is approximate.") else "The ZINB likelihood-ratio comparison could not be reliably evaluated."`
+
+## 5.3 Compare NB2, ZINB, and hurdle NB using AIC and BIC
+
+The hurdle model is not nested within NB2, so a conventional nested-model likelihood-ratio test is not appropriate for that comparison.
+
+We instead compare all three models using AIC and BIC.
+
+```{r}
+#| label: zero-model-comparison
+
+zero_model_comparison <- tibble(
+  Model = names(candidate_models),
+
+  Parameters = vapply(
+    candidate_models,
+    function(m) as.numeric(attr(logLik(m), "df")),
+    numeric(1)
+  ),
+
+  AIC = vapply(
+    candidate_models,
+    function(m) as.numeric(AIC(m)),
+    numeric(1)
+  ),
+
+  BIC = vapply(
+    candidate_models,
+    function(m) as.numeric(BIC(m)),
+    numeric(1)
+  ),
+
+  Converged = vapply(
+    candidate_models,
+    fit_is_ok,
+    logical(1)
+  )
+)
+
+zero_model_comparison |>
+  mutate(
+    Converged = if_else(Converged, "Yes", "No")
+  ) |>
+  gt() |>
+  tab_header(
+    title = "NB2, ZINB, and Hurdle NB Model Fit"
+  ) |>
+  fmt_number(
+    columns = c(AIC, BIC),
+    decimals = 2
+  ) |>
+  cols_label(
+    Parameters = "Number of parameters"
+  ) |>
+  sub_missing(
+    columns = c(AIC, BIC),
+    missing_text = "Unavailable"
+  )
+```
+
+## 5.4 Choose a provisional model and recheck it
+
+We provisionally select the model with the lowest AIC among candidates that pass the convergence and Hessian checks.
+
+BIC is also examined, and the selected model is reassessed using DHARMa.
+
+```{r}
+#| label: select-zero-model
+
+usable <- which(
+  zero_model_comparison$Converged &
+    is.finite(zero_model_comparison$AIC)
+)
+
+if (length(usable) == 0) {
+  stop("No count model passed the convergence checks.")
+}
+
+best_aic_row <- usable[
+  which.min(zero_model_comparison$AIC[usable])
+]
+
+best_bic_row <- usable[
+  which.min(zero_model_comparison$BIC[usable])
+]
+
+selected_name <- zero_model_comparison$Model[best_aic_row]
+bic_winner <- zero_model_comparison$Model[best_bic_row]
+
+selected_model <- candidate_models[[selected_name]]
+
+set.seed(9041)
+
+selected_res <- simulateResiduals(
+  selected_model,
+  n = 500,
+  plot = FALSE
+)
+
+selected_disp <- testDispersion(
+  selected_res,
+  plot = FALSE
+)
+
+selected_zi <- testZeroInflation(
+  selected_res,
+  plot = FALSE
+)
+
+selected_uniform <- testUniformity(
+  selected_res,
+  plot = FALSE
+)
+```
+
+The lowest AIC among converged candidates belongs to **`r selected_name`** (AIC = `r format_num(zero_model_comparison$AIC[best_aic_row])`).
+
+The lowest BIC belongs to **`r bic_winner`** (BIC = `r format_num(zero_model_comparison$BIC[best_bic_row])`).
+
+`r if (identical(selected_name, bic_winner)) "AIC and BIC agree on the preferred model." else "AIC and BIC disagree, so the evidence supporting one preferred model is less straightforward."`
+
+### Selected model: Q-Q plot
+
+```{r}
+#| label: selected-zero-qq
+#| fig-width: 8
+#| fig-height: 5.8
+#| fig-cap: "DHARMa Q-Q plot for the provisionally selected model."
+
+plot_dharma_qq(
+  selected_res,
+  paste(selected_name, ": residual Q-Q plot")
+)
+```
+
+### Selected model: residuals versus fitted values
+
+```{r}
+#| label: selected-zero-fitted
+#| fig-width: 8
+#| fig-height: 5.8
+#| fig-cap: "DHARMa residuals versus fitted counts for the selected model."
+
+plot_dharma_fitted(
+  selected_res,
+  paste(selected_name, ": residuals vs. fitted")
+)
+```
+
+### Diagnostic tests for the selected model
+
+```{r}
+#| label: selected-zero-tests
+
+selected_diagnostics <- tibble(
+  Test = c(
+    "Dispersion",
+    "Observed/expected zeros",
+    "Residual uniformity"
+  ),
+
+  Ratio = c(
+    unname(selected_disp$statistic),
+    unname(selected_zi$statistic),
+    NA_real_
+  ),
+
+  p_value = c(
+    selected_disp$p.value,
+    selected_zi$p.value,
+    selected_uniform$p.value
+  )
+)
+
+selected_diagnostics |>
+  gt() |>
+  tab_header(
+    title = paste("DHARMa Diagnostics:", selected_name)
+  ) |>
+  cols_label(
+    p_value = "p-value"
+  ) |>
+  fmt_number(
+    columns = Ratio,
+    decimals = 2
+  ) |>
+  fmt(
+    columns = p_value,
+    fns = function(x) {
+      ifelse(
+        is.na(x),
+        "—",
+        ifelse(x < .001, "< .001", sprintf("%.3f", x))
+      )
+    }
+  ) |>
+  sub_missing(
+    columns = Ratio,
+    missing_text = "—"
+  )
+```
+
+## 5.5 Justify the model choice
+
+The provisional model selected by AIC is **`r selected_name`**.
+
+Its DHARMa dispersion ratio was `r format_num(unname(selected_disp$statistic))` (`r format_p(selected_disp$p.value)`), and its observed-to-expected zero ratio was `r format_num(unname(selected_zi$statistic))` (`r format_p(selected_zi$p.value)`).
+
+The residual-uniformity test yielded `r format_p(selected_uniform$p.value)`.
+
+`r if (selected_disp$p.value >= .05 && selected_zi$p.value >= .05 && selected_uniform$p.value >= .05) "All three formal checks were nonsignificant, suggesting reasonable model adequacy according to these tests." else if (selected_zi$p.value < .05) "The model still showed a significant mismatch in the number of zeros and should therefore be treated as a provisional choice." else "The model reproduced the observed zeros, but at least one other residual diagnostic remained significant."`
+
+### Interpretation of the selected model's graphs
+
+The hurdle negative binomial Q-Q plot follows the expected diagonal reasonably closely, although small systematic departures remain around the middle and upper quantiles.
+
+The residual-versus-fitted plot shows a broad vertical spread, with most predicted values concentrated around approximately four to six physician visits. There is no strong single diagonal pattern, but the spread and residual distribution do not establish perfect model fit.
+
+Importantly, the model reproduces the observed number of zeros, as indicated by its zero-inflation diagnostic. However, the significant dispersion and uniformity tests suggest that some model misspecification remains.
+
+The hurdle model is therefore preferred based on relative model fit and its ability to reproduce zeros, but its limitations must be acknowledged when interpreting regression effects.
+
+Model fit alone does not establish that the zero process represents a distinct real-world mechanism.
+
+# Part 6: Test and Probe an Interaction
+
+## 6.1 Prediction
+
+We test whether **private insurance (no versus yes)** moderates the association between chronic conditions and physician visits.
+
+We predict that more chronic conditions will be associated with more office visits in both insurance groups, but the association may be stronger among participants with private insurance because coverage may reduce barriers to accessing medical care.
+
+This is a statistical prediction, not a causal claim about the effect of insurance.
+
+## 6.2 Fit the interaction model
+
+We carry forward the **`r selected_name`** model selected in Part 5.
+
+The interaction is added to the conditional count component as `chronic * insurance`, while all other predictors remain controls.
+
+When the selected model includes a separate zero component, that component remains unchanged.
+
+```{r}
+#| label: insurance-interaction-fit
+
+interaction_formula <- visits ~
+  chronic * insurance + health + gender + school
+
+zero_formula <- ~ chronic + health + gender + school + insurance
+
+if (selected_name == "NB2") {
+
+  interaction_model <- glmmTMB(
+    formula = interaction_formula,
+    data = analysis_data,
+    family = nbinom2(link = "log")
+  )
+
+} else if (selected_name == "ZINB") {
+
+  interaction_model <- glmmTMB(
+    formula = interaction_formula,
+    ziformula = zero_formula,
+    data = analysis_data,
+    family = nbinom2(link = "log")
+  )
+
+} else {
+
+  interaction_model <- glmmTMB(
+    formula = interaction_formula,
+    ziformula = zero_formula,
+    data = analysis_data,
+    family = truncated_nbinom2(link = "log")
+  )
+}
+
+if (!fit_is_ok(interaction_model)) {
+  stop("The interaction model did not pass convergence/Hessian checks.")
+}
+```
+
+## 6.3 Test whether the interaction is needed
+
+We compare the additive model with the interaction model using a likelihood-ratio test.
+
+Since insurance has only two levels, adding `chronic:insurance` to the conditional count component introduces one additional parameter.
+
+```{r}
+#| label: insurance-interaction-lrt
+
+lrt_int <- anova(
+  selected_model,
+  interaction_model
+)
+
+as.data.frame(lrt_int) |>
+  tibble::rownames_to_column("Model") |>
+  gt() |>
+  tab_header(
+    title = "Additive versus Chronic Conditions × Insurance"
+  ) |>
+  fmt_number(
+    columns = c(AIC, BIC, logLik, deviance, Chisq),
+    decimals = 2
+  ) |>
+  fmt(
+    columns = `Pr(>Chisq)`,
+    fns = function(x) {
+      ifelse(
+        is.na(x),
+        "—",
+        ifelse(x < .001, "< .001", sprintf("%.3f", x))
+      )
+    }
+  )
+
+interaction_p <- lrt_int[2, "Pr(>Chisq)"]
+
+interaction_b <- unname(
+  fixef(interaction_model)$cond["chronic:insuranceyes"]
+)
+```
+
+### Interpretation
+
+The interaction likelihood-ratio test yielded χ²(`r lrt_int[2, "Chi Df"]`) = `r format_num(lrt_int[2, "Chisq"])`, `r format_p(interaction_p)`.
+
+`r if (interaction_p < .05) "Adding the interaction significantly improved model fit, suggesting that the chronic-conditions association in the conditional count component differs by insurance status." else "Adding the interaction did not significantly improve model fit, providing insufficient evidence that the association between chronic conditions and the conditional count component differs by insurance status."`
+
+The interaction is probed below regardless of statistical significance.
+
+The omnibus test evaluates whether adding the interaction improves fit, whereas the simple slopes and simple effects describe the estimated associations within groups and at specific predictor values.
+
+## 6.4 Plot predicted physician visits
+
+We use `predict_response()` to estimate physician visits across chronic conditions separately for people with and without private insurance.
+
+For zero-inflated or hurdle models, predictions include both model components and therefore represent overall expected visits, including zeros.
+
+For NB2, ordinary fixed-effect predictions are used.
+
+```{r}
+#| label: insurance-interaction-predictions
+
+prediction_type <- if (
+  selected_name == "NB2"
+) {
+  "fixed"
+} else {
+  "zero_inflated"
+}
+
+interaction_predictions <- predict_response(
+  interaction_model,
+  terms = c("chronic [all]", "insurance"),
+  type = prediction_type
+)
+
+prediction_df <- as.data.frame(interaction_predictions) |>
+  mutate(
+    x = as.numeric(as.character(x)),
+    group = factor(
+      as.character(group),
+      levels = c("no", "yes")
+    )
+  )
+```
+
+```{r}
+#| label: insurance-interaction-plot
+#| fig-width: 9
+#| fig-height: 5.7
+#| fig-cap: "Predicted physician visits across chronic conditions by private insurance status, with 95% confidence bands."
+
+ggplot(
+  prediction_df,
+  aes(
+    x = x,
+    y = predicted,
+    colour = group,
+    fill = group
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = conf.low,
+      ymax = conf.high
+    ),
+    alpha = 0.13,
+    colour = NA
+  ) +
+  geom_line(
+    linewidth = 1.15
+  ) +
+  scale_colour_manual(
+    values = c(
+      no = "#356BA0",
+      yes = "#CF7B32"
+    ),
+    labels = c(
+      no = "No insurance",
+      yes = "Private insurance"
+    )
+  ) +
+  scale_fill_manual(
+    values = c(
+      no = "#356BA0",
+      yes = "#CF7B32"
+    ),
+    labels = c(
+      no = "No insurance",
+      yes = "Private insurance"
+    )
+  ) +
+  labs(
+    title = "Physician visits by chronic conditions and insurance",
+    x = "Number of chronic conditions",
+    y = "Predicted physician office visits",
+    colour = "Private insurance",
+    fill = "Private insurance"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 13
+    ),
+    legend.position = "bottom",
+    plot.margin = margin(10, 16, 12, 12)
+  )
+```
+
+### Interpretation of the prediction graph
+
+The predicted number of physician visits increases with chronic conditions in both insurance groups.
+
+Across the displayed range, the private-insurance group generally has higher predicted visits than the no-insurance group. However, the two curves have broadly similar shapes, and the confidence bands overlap.
+
+The confidence bands also widen at higher numbers of chronic conditions, indicating greater uncertainty in this part of the predictor range.
+
+Although the graph suggests differences in predicted visit levels, visual differences do not establish a statistically significant interaction. The formal likelihood-ratio test must be used to evaluate whether the slopes differ.
+
+## 6.5 Probe the interaction with `emmeans`
+
+### Simple slopes: chronic conditions within each insurance group
+
+We use `emtrends()` to estimate the chronic-conditions slope separately for participants with and without private insurance.
+
+The conditional count component is specified because that is where the interaction was added.
+
+```{r}
+#| label: insurance-simple-slopes
+
+simple_slopes <- emtrends(
+  interaction_model,
+  specs = ~ insurance,
+  var = "chronic",
+  component = "cond"
+)
+
+simple_slopes_df <- as.data.frame(
+  summary(
+    simple_slopes,
+    infer = c(TRUE, TRUE)
+  )
+)
+
+simple_slopes_df |>
+  gt() |>
+  tab_header(
+    title = "Simple Slopes of Chronic Conditions by Insurance"
+  ) |>
+  fmt_number(
+    columns = where(is.numeric),
+    decimals = 3
+  ) |>
+  fmt(
+    columns = p.value,
+    fns = function(x) {
+      ifelse(
+        x < .001,
+        "< .001",
+        sprintf("%.3f", x)
+      )
+    }
+  ) |>
+  tab_source_note(
+    "Slopes and confidence intervals are on the conditional log-count scale."
+  )
+```
+
+### Compare the two slopes
+
+```{r}
+#| label: insurance-slope-contrast
+
+slope_comparison <- as.data.frame(
+  summary(
+    pairs(simple_slopes)
+  )
+)
+
+slope_comparison |>
+  gt() |>
+  tab_header(
+    title = "Difference Between Insurance-Group Slopes"
+  ) |>
+  fmt_number(
+    columns = where(is.numeric),
+    decimals = 3
+  ) |>
+  fmt(
+    columns = p.value,
+    fns = function(x) {
+      ifelse(
+        x < .001,
+        "< .001",
+        sprintf("%.3f", x)
+      )
+    }
+  ) |>
+  tab_source_note(
+    "The pairwise contrast is no insurance minus private insurance."
+  )
+```
+
+### Interpretation of the slope comparison
+
+The estimated interaction coefficient for `chronic:insuranceyes` is **`r format_num(interaction_b, 3)`**.
+
+The estimated slope contrast from `pairs()` is **`r format_num(slope_comparison$estimate[1], 3)`**.
+
+Because the reference order is `no` followed by `yes`, the pairwise contrast calculates **no − yes**, whereas the interaction coefficient represents **yes − no**.
+
+The signs therefore differ, but the two tests address the same slope difference. With a two-level moderator, the corresponding Wald tests are equivalent apart from numerical rounding.
+
+`r if (interaction_p < .05) "The significant omnibus test supports different conditional log-count slopes between the two insurance groups." else "The nonsignificant omnibus test does not provide sufficient evidence that the conditional log-count slopes differ between insurance groups."`
+
+### Simple effects: insurance differences at low, average, and high chronic conditions
+
+We define three probing values based on the sample mean and standard deviation of chronic conditions:
+
+- −1 SD
+- Mean
+- +1 SD
+
+Fractional values are acceptable for probing a numeric predictor, even though individual chronic-condition counts are integers.
+
+```{r}
+#| label: insurance-probe-values
+
+chronic_mean <- mean(
+  analysis_data$chronic
+)
+
+chronic_sd <- sd(
+  analysis_data$chronic
+)
+
+probe_values <- as.numeric(
+  chronic_mean + c(-1, 0, 1) * chronic_sd
+)
+
+probe_table <- tibble(
+  `Chronic conditions` = c(
+    "−1 SD",
+    "Mean",
+    "+1 SD"
+  ),
+  Value = probe_values
+)
+
+probe_table |>
+  gt() |>
+  fmt_number(
+    columns = Value,
+    decimals = 2
+  ) |>
+  tab_header(
+    title = "Chronic-Condition Values Used for Probing"
+  )
+
+insurance_emmeans <- emmeans(
+  interaction_model,
+  specs = ~ insurance | chronic,
+  at = list(
+    chronic = probe_values
+  ),
+  component = "cond"
+)
+```
+
+### Back-transformed estimated marginal means
+
+We also report the estimated marginal means from the conditional count component, transformed from the log scale.
+
+For hurdle models, these values should not be interpreted as the overall expected physician visits including the zero component.
+
+```{r}
+#| label: insurance-emmeans-response
+
+as.data.frame(
+  summary(insurance_emmeans, type = "response")
+) |>
+  gt() |>
+  tab_header(
+    title = "Back-Transformed Count-Component Means"
+  ) |>
+  fmt_number(
+    columns = where(is.numeric),
+    decimals = 3
+  ) |>
+  tab_source_note(
+    "Estimates are from the conditional count component, not overall hurdle-model means."
+  )
+```
+
+### Understanding differences between `emmeans` and `ggeffects`
+
+For the hurdle model, `component = "cond"` targets the log-linked negative binomial count component, whereas the `ggeffects` graph displays overall expected visits including zeros.
+
+These are different quantities, so their predictions may differ.
+
+The functions also handle other predictors differently by default: `emmeans` typically averages over factor levels, while `ggeffects` holds covariates at typical or reference values.
+
+Within the same additive conditional log-count component, the control-variable terms cancel when comparing two insurance levels at a fixed chronic-condition value. Consequently, the log-scale insurance contrast does not change merely because typical rather than averaged control values are used.
+
+That invariance does not automatically extend to contrasts of the full two-part hurdle-model predictions.
+
+## 6.6 Report the simple effects in a table
+
+We compare no private insurance minus private insurance at low, average, and high chronic-condition values.
+
+The effects, standard errors, and z statistics are computed on the conditional log-count scale.
+
+```{r}
+#| label: insurance-simple-effects-table
+
+simple_effects_df <- as.data.frame(
+  summary(
+    pairs(insurance_emmeans)
+  )
+) |>
+  mutate(
+    probe_label = c(
+      "−1 SD",
+      "Mean",
+      "+1 SD"
+    )[
+      match(
+        round(chronic, 6),
+        round(probe_values, 6)
+      )
+    ]
+  ) |>
+  transmute(
+    `Chronic conditions` = probe_label,
+    Contrast = contrast,
+    `Log contrast` = estimate,
+    SE = SE,
+    z = z.ratio,
+    p = p.value
+  )
+
+simple_effects_df |>
+  gt() |>
+  tab_header(
+    title = "Simple Effects of Private Insurance",
+    subtitle = "At low, average, and high chronic conditions"
+  ) |>
+  fmt_number(
+    columns = c(
+      `Log contrast`,
+      SE,
+      z
+    ),
+    decimals = 3
+  ) |>
+  fmt(
+    columns = p,
+    fns = function(x) {
+      ifelse(
+        x < .001,
+        "< .001",
+        sprintf("%.3f", x)
+      )
+    }
+  ) |>
+  tab_source_note(
+    "All tests and contrasts are computed on the conditional log-count scale (no insurance minus private insurance)."
+  )
+```
+
+## 6.7 Interpret the interaction
+
+The likelihood-ratio test for the chronic-conditions × insurance interaction was χ²(`r lrt_int[2, "Chi Df"]`) = `r format_num(lrt_int[2, "Chisq"])`, `r format_p(interaction_p)`.
+
+`r if (interaction_p < .05) "This provides evidence that the conditional count-component association between chronic conditions and physician visits differs by insurance status." else "This does not provide sufficient evidence that the conditional count-component association between chronic conditions and physician visits differs by insurance status."`
+
+The simple-slope table describes the positive association between chronic conditions and the count component within each insurance group.
+
+The simple-effects table evaluates differences between insurance groups at three specified chronic-condition values.
+
+These probes are useful for describing the pattern of results, but they do not override the omnibus interaction test.
+
+Importantly, the selected `r selected_name` model was preferred by AIC and BIC, but its DHARMa dispersion (`r format_p(selected_disp$p.value)`) and uniformity (`r format_p(selected_uniform$p.value)`) tests indicate that some model misfit remains.
+
+This limits our confidence in the precision of the estimated effects. The observational data also prevent causal conclusions about chronic illness or insurance coverage.
+
+# Part 7: Results and Discussion
+
+## 7.1 APA-style results
+
+The following three results paragraphs use inline R code so that coefficients, confidence intervals, and p-values are updated automatically when the document is rendered.
+
+Main effects are taken from the selected additive model, while moderation estimates are taken from the interaction model.
+
+For the hurdle model, the reported coefficients refer to its conditional count component rather than overall expected physician visits.
+
+```{r}
+#| label: results-coefficients
+
+main_effects <- broom.mixed::tidy(
+  selected_model,
+  effects = "fixed",
+  component = "cond",
+  conf.int = TRUE,
+  conf.level = 0.95,
+  conf.method = "Wald"
+) |>
+  filter(term != "(Intercept)") |>
+  mutate(
+    Comparison = case_when(
+      term == "chronic" ~ "Each additional chronic condition",
+      term == "healthpoor" ~ "Poor versus average health",
+      term == "healthexcellent" ~ "Excellent versus average health",
+      term == "genderfemale" ~ "Female versus male",
+      term == "school" ~ "Each additional year of education",
+      term == "insuranceyes" ~ "Private insurance versus no insurance",
+      TRUE ~ term
+    )
+  )
+
+main_effects |>
+  select(
+    Comparison,
+    estimate,
+    conf.low,
+    conf.high,
+    p.value
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Selected Additive Model: Conditional Count Effects",
+    subtitle = "Unstandardized log-link coefficients and Wald 95% CIs"
+  ) |>
+  cols_label(
+    estimate = "b",
+    conf.low = "95% CI lower",
+    conf.high = "95% CI upper",
+    p.value = "p-value"
+  ) |>
+  fmt_number(
+    columns = c(estimate, conf.low, conf.high),
+    decimals = 3
+  ) |>
+  fmt(
+    columns = p.value,
+    fns = function(x) {
+      ifelse(
+        x < .001,
+        "< .001",
+        sprintf("%.3f", x)
+      )
+    }
+  ) |>
+  tab_source_note(
+    "Coefficients refer to the conditional count component; other covariates are held constant."
+  )
+
+# Extract simple slopes and simple effects for APA reporting.
+
+slope_no <- simple_slopes_df |>
+  filter(insurance == "no") |>
+  slice(1)
+
+slope_yes <- simple_slopes_df |>
+  filter(insurance == "yes") |>
+  slice(1)
+
+probe_effects <- simple_effects_df |>
+  mutate(
+    Description = c(
+      "−1 SD",
+      "mean",
+      "+1 SD"
+    )
+  )
+
+largest_probe <- probe_effects$Description[
+  which.max(abs(probe_effects[["Log contrast"]]))
+]
+
+# Automatically format main-effect results.
+
+effect_result <- function(term_name) {
+
+  row <- main_effects[
+    main_effects$term == term_name,
+    ,
+    drop = FALSE
+  ]
+
+  if (nrow(row) != 1) {
+    stop("Could not identify main effect: ", term_name)
+  }
+
+  paste0(
+    "b = ",
+    format_num(row$estimate, 3),
+    ", 95% CI [",
+    format_num(row$conf.low, 3),
+    ", ",
+    format_num(row$conf.high, 3),
+    "], ",
+    format_p(row$p.value)
+  )
+}
+
+pct_effect <- function(term_name) {
+
+  b <- main_effects$estimate[
+    match(term_name, main_effects$term)
+  ]
+
+  100 * (exp(b) - 1)
+}
+```
+
+### Paragraph 1 — Model selection
+
+We analysed physician office visits among `r visit_summary$n` older adults (*M* = `r format_num(visit_summary$mean)`, variance = `r format_num(visit_summary$variance)`), of whom `r format_num(visit_summary$zero_percent, 1)`% reported no visits. The full Poisson model demonstrated substantial overdispersion (ratio = `r format_num(unname(disp_pois$statistic))`, `r format_p(disp_pois$p.value)`) and underestimated zero counts (observed/expected ratio = `r format_num(unname(zi_pois$statistic))`, `r format_p(zi_pois$p.value)`). NB2 significantly improved fit relative to Poisson, χ²(`r lrt_nb[2, "Chi Df"]`) = `r format_num(lrt_nb[2, "Chisq"])`, `r format_p(lrt_nb[2, "Pr(>Chisq)"])`. NB2 addressed the dispersion mismatch (ratio = `r format_num(unname(disp_nb$statistic))`, `r format_p(disp_nb$p.value)`), but still underestimated zeros (ratio = `r format_num(unname(zi_nb$statistic))`, `r format_p(zi_nb$p.value)`), motivating comparison with models incorporating a separate zero component. Among the converged models, **`r selected_name`** had the lowest AIC (`r format_num(AIC(selected_model))`) and BIC (`r format_num(BIC(selected_model))`). Its zero ratio was `r format_num(unname(selected_zi$statistic))` (`r format_p(selected_zi$p.value)`), although significant dispersion (`r format_p(selected_disp$p.value)`) and uniformity (`r format_p(selected_uniform$p.value)`) tests indicated remaining model misspecification.
+
+### Paragraph 2 — Main effects
+
+Holding the other predictors constant, each additional chronic condition was associated with greater conditional count-component intensity (`r effect_result("chronic")`). Relative to average perceived health, poor health was associated with higher count intensity (`r effect_result("healthpoor")`), whereas excellent health was associated with lower count intensity (`r effect_result("healthexcellent")`). Each additional year of education was associated with greater count intensity (`r effect_result("school")`), as was having private insurance rather than no private insurance (`r effect_result("insuranceyes")`). Female gender relative to male gender was not a statistically significant predictor (`r effect_result("genderfemale")`). The reference groups were average health, male gender, and no private insurance. These estimates describe the conditional count component of the selected model, rather than the full expected number of visits after accounting for its zero component.
+
+### Paragraph 3 — Interaction
+
+Adding the chronic-conditions × private-insurance interaction to the conditional count component did not significantly improve model fit, χ²(`r lrt_int[2, "Chi Df"]`) = `r format_num(lrt_int[2, "Chisq"])`, `r format_p(interaction_p)`. The chronic-conditions slope was *b* = `r format_num(slope_no$chronic.trend, 3)`, 95% CI \[`r format_num(slope_no$asymp.LCL, 3)`, `r format_num(slope_no$asymp.UCL, 3)`\], `r format_p(slope_no$p.value)`, among participants without private insurance, and *b* = `r format_num(slope_yes$chronic.trend, 3)`, 95% CI \[`r format_num(slope_yes$asymp.LCL, 3)`, `r format_num(slope_yes$asymp.UCL, 3)`\], `r format_p(slope_yes$p.value)`, among those with private insurance. The conditional insurance contrasts (no minus yes) at −1 SD, the mean, and +1 SD chronic conditions were `r paste0("b = ", format_num(probe_effects[["Log contrast"]][1], 3), ", ", format_p(probe_effects$p[1]))`; `r paste0("b = ", format_num(probe_effects[["Log contrast"]][2], 3), ", ", format_p(probe_effects$p[2]))`; and `r paste0("b = ", format_num(probe_effects[["Log contrast"]][3], 3), ", ", format_p(probe_effects$p[3]))`, respectively. The largest absolute conditional insurance contrast occurred at `r largest_probe`. Although insurance-group contrasts were detectable at the examined chronic-condition values, the nonsignificant interaction test does not establish that the chronic-conditions slopes differed between groups.
+
+## 7.2 Discussion
+
+The findings demonstrate why count regression requires careful attention to the distribution of the outcome and the assumptions of the fitted model. Physician visits exhibited considerable variability, and the initial Poisson model substantially underestimated both dispersion and zeros. NB2 improved the representation of variability, but it continued to underpredict zeros. The hurdle negative binomial model achieved the lowest AIC and BIC and reproduced the observed zero frequency. However, significant residual dispersion and uniformity tests indicated that some model misspecification remained. The hurdle model is therefore the preferred model in relative terms rather than evidence of perfect model adequacy.
+
+Chronic conditions and self-perceived health were important predictors of the conditional count component. Holding other predictors constant, each additional chronic condition corresponded to approximately `r format_num(pct_effect("chronic"), 1)`% higher modelled count intensity. Compared with average perceived health, poor health corresponded to approximately `r format_num(pct_effect("healthpoor"), 1)`% higher intensity, whereas excellent health corresponded to approximately `r format_num(abs(pct_effect("healthexcellent")), 1)`% lower intensity. Each additional year of education was associated with approximately `r format_num(pct_effect("school"), 1)`% higher intensity, and private insurance with approximately `r format_num(pct_effect("insuranceyes"), 1)`% higher intensity. The gender contrast was not statistically significant at α = .05. These percentages are useful for interpreting the exponentiated coefficients, but the predictors use different measurement scales and cannot be ranked directly by the size of their coefficients. Moreover, these estimates refer to the model's conditional count component and do not represent percentage changes in overall physician visits, which also depend on the hurdle's zero component.
+
+The chronic-conditions × insurance interaction was not statistically significant, suggesting that the relationship between chronic conditions and the conditional count component did not differ detectably between insurance groups. Nevertheless, insurance-group differences were observed at individual chronic-condition values. These findings are compatible because differences in predicted count levels can occur without significantly different slopes. The simple-effects results should therefore be interpreted as descriptions of estimated differences rather than evidence supporting moderation.
+
+Several limitations should be considered. The study is observational, preventing causal conclusions about chronic conditions, health status, or insurance coverage. The data are also historically dated and may not represent current patterns of health-care utilization. Self-report and measurement error, unmeasured confounding, differences in health-care access, and socioeconomic factors may influence the observed associations. In addition, these analyses do not incorporate the complex survey design, and the final model continues to show some residual misspecification. Future analyses could evaluate additional predictors, flexible model specifications, and survey-design adjustments, followed by further residual checks.
+

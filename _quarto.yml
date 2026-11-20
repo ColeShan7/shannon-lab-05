@@ -1,0 +1,23 @@
+
+project:
+  type: website
+  output-dir: docs
+
+website:
+  title: "Lab 5: Count Regression"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Home
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+
+execute:
+  warning: false
+  message: false
